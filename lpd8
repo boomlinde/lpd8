@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import json
+import select
+
+PYTHON3 = sys.version_info[0] == 3
+
+SYSEX_START = 0xf0
+SYSEX_STOP = 0xf7
+MANUFACTURER = 0x47
+MODEL1 = 0x7f
+MODEL2 = 0x75
+
+def requestdata(fd, program):
+    data = (
+        SYSEX_START,
+        MANUFACTURER,
+        MODEL1, MODEL2,
+        0x63, 0x00, 0x01,
+        program,
+        SYSEX_STOP,
+    )
+    if PYTHON3:
+        os.write(fd, bytes(data))
+    else:
+        os.write(fd, ''.join(chr(x) for x in data))
+
+def read_channel(data):
+    return data.pop(0) + 1
+
+def read_pad(data):
+    note = data.pop(0)
+    pc = data.pop(0)
+    cc = data.pop(0)
+    toggle = data.pop(0) == 1
+    return {
+        'note': note,
+        'pc': pc,
+        'cc': cc,
+        'toggle': toggle,
+    }
+
+def read_knob(data):
+    cc = data.pop(0)
+    low = data.pop(0)
+    high = data.pop(0)
+    return {
+        'cc': cc,
+        'min': low,
+        'max': high,
+    }
+
+def read_data(fd):
+    ch = 0
+    data = []
+
+    # Wait until sysex start
+    while ch != SYSEX_START:
+        ch = ord(os.read(fd, 1))
+
+    # Read whole sysex message
+    while True:
+        nextbyte = os.read(fd, 1)
+        if ord(nextbyte) == SYSEX_STOP: break
+        data.append(ord(nextbyte))
+
+    # Skip sysex header
+    data = data[7:]
+
+    channel = read_channel(data)
+    pads = [read_pad(data) for _ in range(8)]
+    knobs = [read_knob(data) for _ in range(8)]
+    return {
+        'channel': channel,
+        'pads': pads,
+        'knobs': knobs,
+    }
+
+def write_pad(data, pad):
+    data.append(pad['note'])
+    data.append(pad['pc'])
+    data.append(pad['cc'])
+    data.append(int(pad['toggle']))
+
+def write_knob(data, knob):
+    data.append(knob['cc'])
+    data.append(knob['min'])
+    data.append(knob['max'])
+
+def write_data(fd, program):
+    js = json.load(sys.stdin)
+    data = [
+        SYSEX_START,
+        MANUFACTURER,
+        MODEL1, MODEL2,
+        0x61, 0x00, 0x3a, program
+    ]
+
+    data.append(js['channel'] - 1)
+    for pad in js['pads']:
+        write_pad(data, pad)
+    for knob in js['knobs']:
+        write_knob(data, knob)
+
+    data.append(SYSEX_STOP)
+    if PYTHON3:
+        os.write(fd, bytes(data))
+    else:
+        os.write(fd, ''.join(chr(x) for x in data))
+
+def exit_usage():
+    sys.stderr.write(
+        'Usage: %s <program> <device file>\n\n' % sys.argv[0]
+    )
+    sys.stderr.write(
+        'When stdin is a pipe, lpd8 loads a program from stdin\n'
+    )
+    sys.stderr.write(
+        'Otherwise, it writes the current program to stdout.\n'
+    )
+    sys.exit(1)
+
+def clearpending(fd):
+    while True:
+        l, _, _ = select.select((fd,), (), (), 0.1)
+        if not l: break
+        os.read(fd, 1)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3: exit_usage()
+
+    try:
+        program = int(sys.argv[1])
+    except ValueError:
+        exit_usage()
+    if program < 1 or program > 4:
+        exit_usage()
+
+    device = sys.argv[2]
+    fd = os.open(device, os.O_RDWR)
+    clearpending(fd)
+
+    try:
+        if sys.stdin.isatty():
+            requestdata(fd, program)
+            print(json.dumps(
+                read_data(fd),
+                indent=2,
+                separators=(',', ': '),
+                sort_keys=True
+            ))
+        else:
+            write_data(fd, program)
+    finally:
+        os.close(fd)
+
